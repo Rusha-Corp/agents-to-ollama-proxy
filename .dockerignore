@@ -1,0 +1,7 @@
+.env
+.factory
+.agent
+.git
+bin
+dist
+coverage.out
