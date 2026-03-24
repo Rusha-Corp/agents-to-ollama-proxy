@@ -140,6 +140,7 @@ func (s *Server) handleChatCompletionsStream(w http.ResponseWriter, r *http.Requ
 	}
 
 	includeRole := false
+	sawToolCalls := false
 	for {
 		response, err := stream.Next()
 		if errors.Is(err, io.EOF) {
@@ -151,7 +152,14 @@ func (s *Server) handleChatCompletionsStream(w http.ResponseWriter, r *http.Requ
 		}
 
 		chunk := translate.OllamaToChatCompletionChunk(response, streamID, upstreamRequest.Model, includeRole)
-		if chunk.Choices[0].FinishReason == nil && chunk.Choices[0].Delta.Role == "" && chunk.Choices[0].Delta.Content == "" {
+		if len(chunk.Choices[0].Delta.ToolCalls) > 0 {
+			sawToolCalls = true
+		}
+		if sawToolCalls && chunk.Choices[0].FinishReason != nil && *chunk.Choices[0].FinishReason == "stop" {
+			finishReason := "tool_calls"
+			chunk.Choices[0].FinishReason = &finishReason
+		}
+		if chunk.Choices[0].FinishReason == nil && chunk.Choices[0].Delta.Role == "" && chunk.Choices[0].Delta.Content == "" && len(chunk.Choices[0].Delta.ToolCalls) == 0 {
 			continue
 		}
 		includeRole = false

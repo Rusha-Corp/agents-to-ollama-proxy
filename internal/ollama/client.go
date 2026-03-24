@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -110,11 +111,13 @@ func (c *Client) doJSON(ctx context.Context, method, path string, requestBody an
 
 func (c *Client) do(ctx context.Context, method, path string, requestBody any) (*http.Response, error) {
 	var body io.Reader
+	var payload []byte
 	if requestBody != nil {
-		payload, err := json.Marshal(requestBody)
+		encoded, err := json.Marshal(requestBody)
 		if err != nil {
 			return nil, fmt.Errorf("marshal upstream request: %w", err)
 		}
+		payload = encoded
 		body = bytes.NewReader(payload)
 	}
 
@@ -134,6 +137,9 @@ func (c *Client) do(ctx context.Context, method, path string, requestBody any) (
 	}
 
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		if len(payload) > 0 && response.StatusCode == http.StatusBadRequest {
+			log.Printf("upstream_bad_request path=%s payload=%s", path, truncateForLog(payload, 8192))
+		}
 		defer response.Body.Close()
 		return nil, parseUpstreamError(response)
 	}
@@ -160,4 +166,11 @@ func parseUpstreamError(response *http.Response) error {
 	}
 
 	return &UpstreamError{StatusCode: response.StatusCode, Message: message}
+}
+
+func truncateForLog(payload []byte, limit int) string {
+	if len(payload) <= limit {
+		return string(payload)
+	}
+	return string(payload[:limit]) + "...<truncated>"
 }

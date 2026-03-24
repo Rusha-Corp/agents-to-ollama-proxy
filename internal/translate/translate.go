@@ -1,8 +1,10 @@
 package translate
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -20,6 +22,49 @@ var modelAliases = map[string]string{
 	"kimi-k2.5:cloud":        "kimi-k2.5",
 }
 
+type openAIToolCallInput struct {
+	Function openAIToolFunctionInput `json:"function"`
+}
+
+type openAIToolFunctionInput struct {
+	Name      string `json:"name,omitempty"`
+	Arguments any    `json:"arguments,omitempty"`
+}
+
+type openAIToolCall struct {
+	ID       string             `json:"id,omitempty"`
+	Function openAIToolFunction `json:"function"`
+	Type     string             `json:"type"`
+}
+
+type openAIToolFunction struct {
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments"`
+}
+
+type openAIChunkToolCall struct {
+	Index    int                      `json:"index"`
+	ID       string                   `json:"id,omitempty"`
+	Function *openAIChunkToolFunction `json:"function,omitempty"`
+	Type     string                   `json:"type,omitempty"`
+}
+
+type openAIChunkToolFunction struct {
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
+}
+
+type ollamaToolCall struct {
+	ID       string             `json:"id,omitempty"`
+	Function ollamaToolFunction `json:"function"`
+	Type     string             `json:"type,omitempty"`
+}
+
+type ollamaToolFunction struct {
+	Name      string `json:"name,omitempty"`
+	Arguments any    `json:"arguments,omitempty"`
+}
+
 func ChatCompletionToOllama(request openai.ChatCompletionRequest, defaultModel string) (ollama.ChatRequest, error) {
 	model := normalizeModel(firstNonEmpty(request.Model, defaultModel))
 	if model == "" {
@@ -27,17 +72,32 @@ func ChatCompletionToOllama(request openai.ChatCompletionRequest, defaultModel s
 	}
 
 	messages := make([]ollama.Message, 0, len(request.Messages))
+	toolCallNames := map[string]string{}
 	for _, message := range request.Messages {
 		content, err := messageText(message.Content)
 		if err != nil {
 			return ollama.ChatRequest{}, fmt.Errorf("message content: %w", err)
 		}
+		toolCalls, err := normalizeOpenAIToolCallsForOllama(message.ToolCalls)
+		if err != nil {
+			return ollama.ChatRequest{}, fmt.Errorf("message tool calls: %w", err)
+		}
+		toolName := ""
+		if message.Role == "tool" && message.ToolCallID != "" {
+			toolName = toolCallNames[message.ToolCallID]
+		}
+
 		messages = append(messages, ollama.Message{
 			Role:       message.Role,
 			Content:    content,
-			ToolCalls:  message.ToolCalls,
+			ToolCalls:  toolCalls,
 			ToolCallID: message.ToolCallID,
+			ToolName:   toolName,
 		})
+
+		for id, name := range openAIToolCallNames(message.ToolCalls) {
+			toolCallNames[id] = name
+		}
 	}
 	if len(messages) == 0 {
 		return ollama.ChatRequest{}, fmt.Errorf("at least one message is required")
@@ -81,6 +141,7 @@ func CompletionToChatCompletion(request openai.CompletionRequest, defaultModel s
 func OllamaToChatCompletion(response ollama.ChatResponse, requestedModel string) openai.ChatCompletionResponse {
 	model := responseModel(requestedModel, response.Model)
 	created := parseUnix(response.CreatedAt)
+	toolCalls := normalizeOllamaToolCallsForOpenAI(response.Message.ToolCalls)
 	finishReason := mapFinishReason(response.DoneReason)
 	usage := openai.Usage{
 		PromptTokens:     response.PromptEvalCount,
@@ -98,10 +159,10 @@ func OllamaToChatCompletion(response ollama.ChatResponse, requestedModel string)
 			Message: openai.Message{
 				Role:       firstNonEmpty(response.Message.Role, "assistant"),
 				Content:    response.Message.Content,
-				ToolCalls:  response.Message.ToolCalls,
+				ToolCalls:  toolCalls,
 				ToolCallID: response.Message.ToolCallID,
 			},
-			FinishReason: stringPointer(chatFinishReason(finishReason, response.Message.ToolCalls)),
+			FinishReason: stringPointer(chatFinishReason(finishReason, toolCalls)),
 		}},
 		Usage: usage,
 	}
@@ -134,6 +195,7 @@ func OllamaToCompletion(response ollama.ChatResponse, requestedModel string) ope
 func OllamaToChatCompletionChunk(response ollama.ChatResponse, id, requestedModel string, includeRole bool) openai.ChatCompletionChunkResponse {
 	model := responseModel(requestedModel, response.Model)
 	created := parseUnix(response.CreatedAt)
+	toolCalls := normalizeOllamaToolCallsForOpenAIChunk(response.Message.ToolCalls, id)
 	var finishReason *string
 	if response.Done || response.DoneReason != "" {
 		finishReason = stringPointer(mapFinishReason(response.DoneReason))
@@ -146,11 +208,11 @@ func OllamaToChatCompletionChunk(response ollama.ChatResponse, id, requestedMode
 	if response.Message.Content != "" {
 		delta.Content = response.Message.Content
 	}
-	if len(response.Message.ToolCalls) > 0 {
-		delta.ToolCalls = response.Message.ToolCalls
+	if hasToolCalls(toolCalls) {
+		delta.ToolCalls = toolCalls
 	}
 	if finishReason != nil {
-		value := chatFinishReason(*finishReason, response.Message.ToolCalls)
+		value := chatFinishReason(*finishReason, toolCalls)
 		finishReason = stringPointer(value)
 	}
 
@@ -343,10 +405,192 @@ func stringPointer(value string) *string {
 }
 
 func chatFinishReason(reason string, toolCalls []byte) string {
-	if len(toolCalls) > 0 {
+	if hasToolCalls(toolCalls) {
 		return "tool_calls"
 	}
 	return reason
+}
+
+func normalizeOpenAIToolCallsForOllama(raw json.RawMessage) (json.RawMessage, error) {
+	if !hasToolCalls(raw) {
+		return nil, nil
+	}
+
+	var toolCalls []openAIToolCallInput
+	if err := json.Unmarshal(raw, &toolCalls); err != nil {
+		return nil, fmt.Errorf("decode tool_calls: %w", err)
+	}
+	if len(toolCalls) == 0 {
+		return nil, nil
+	}
+
+	normalized := make([]ollamaToolCall, 0, len(toolCalls))
+	for _, toolCall := range toolCalls {
+		arguments, err := parseOpenAIToolArguments(toolCall.Function.Arguments)
+		if err != nil {
+			return nil, fmt.Errorf("decode arguments for %q: %w", toolCall.Function.Name, err)
+		}
+		normalized = append(normalized, ollamaToolCall{
+			Function: ollamaToolFunction{
+				Name:      toolCall.Function.Name,
+				Arguments: arguments,
+			},
+		})
+	}
+
+	payload, err := json.Marshal(normalized)
+	if err != nil {
+		return nil, fmt.Errorf("encode tool_calls: %w", err)
+	}
+	return payload, nil
+}
+
+func openAIToolCallNames(raw json.RawMessage) map[string]string {
+	if !hasToolCalls(raw) {
+		return nil
+	}
+
+	var toolCalls []struct {
+		ID       string `json:"id"`
+		Function struct {
+			Name string `json:"name"`
+		} `json:"function"`
+	}
+	if err := json.Unmarshal(raw, &toolCalls); err != nil {
+		return nil
+	}
+
+	names := make(map[string]string, len(toolCalls))
+	for _, toolCall := range toolCalls {
+		if toolCall.ID == "" || toolCall.Function.Name == "" {
+			continue
+		}
+		names[toolCall.ID] = toolCall.Function.Name
+	}
+	return names
+}
+
+func normalizeOllamaToolCallsForOpenAI(raw json.RawMessage) json.RawMessage {
+	if !hasToolCalls(raw) {
+		return nil
+	}
+
+	var toolCalls []ollamaToolCall
+	if err := json.Unmarshal(raw, &toolCalls); err != nil {
+		return raw
+	}
+	if len(toolCalls) == 0 {
+		return nil
+	}
+
+	normalized := make([]openAIToolCall, 0, len(toolCalls))
+	for _, toolCall := range toolCalls {
+		arguments, err := marshalOpenAIToolArguments(toolCall.Function.Arguments)
+		if err != nil {
+			return raw
+		}
+		normalized = append(normalized, openAIToolCall{
+			ID:   firstNonEmpty(toolCall.ID, NewID("call")),
+			Type: "function",
+			Function: openAIToolFunction{
+				Name:      toolCall.Function.Name,
+				Arguments: arguments,
+			},
+		})
+	}
+
+	payload, err := json.Marshal(normalized)
+	if err != nil {
+		return raw
+	}
+	return payload
+}
+
+func normalizeOllamaToolCallsForOpenAIChunk(raw json.RawMessage, streamID string) json.RawMessage {
+	if !hasToolCalls(raw) {
+		return nil
+	}
+
+	var toolCalls []ollamaToolCall
+	if err := json.Unmarshal(raw, &toolCalls); err != nil {
+		return raw
+	}
+	if len(toolCalls) == 0 {
+		return nil
+	}
+
+	normalized := make([]openAIChunkToolCall, 0, len(toolCalls))
+	for index, toolCall := range toolCalls {
+		arguments, err := marshalOpenAIToolArguments(toolCall.Function.Arguments)
+		if err != nil {
+			return raw
+		}
+		normalized = append(normalized, openAIChunkToolCall{
+			Index: index,
+			ID:    firstNonEmpty(toolCall.ID, fmt.Sprintf("call_%s_%d", streamID, index)),
+			Type:  "function",
+			Function: &openAIChunkToolFunction{
+				Name:      toolCall.Function.Name,
+				Arguments: arguments,
+			},
+		})
+	}
+
+	payload, err := json.Marshal(normalized)
+	if err != nil {
+		return raw
+	}
+	return payload
+}
+
+func parseOpenAIToolArguments(value any) (any, error) {
+	switch typed := value.(type) {
+	case nil:
+		return map[string]any{}, nil
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" {
+			return map[string]any{}, nil
+		}
+		var decoded any
+		if err := json.Unmarshal([]byte(trimmed), &decoded); err != nil {
+			return nil, err
+		}
+		return decoded, nil
+	default:
+		return typed, nil
+	}
+}
+
+func marshalOpenAIToolArguments(value any) (string, error) {
+	switch typed := value.(type) {
+	case nil:
+		return "{}", nil
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" {
+			return "{}", nil
+		}
+		if json.Valid([]byte(trimmed)) {
+			return trimmed, nil
+		}
+		encoded, err := json.Marshal(typed)
+		if err != nil {
+			return "", err
+		}
+		return string(encoded), nil
+	default:
+		encoded, err := json.Marshal(typed)
+		if err != nil {
+			return "", err
+		}
+		return string(encoded), nil
+	}
+}
+
+func hasToolCalls(raw []byte) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null")) && !bytes.Equal(trimmed, []byte("[]"))
 }
 
 func normalizeModel(model string) string {

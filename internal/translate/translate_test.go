@@ -74,6 +74,78 @@ func TestChatCompletionToOllamaPreservesTools(t *testing.T) {
 	}
 }
 
+func TestChatCompletionToOllamaConvertsAssistantToolCalls(t *testing.T) {
+	t.Parallel()
+
+	request := openai.ChatCompletionRequest{
+		Model: "qwen3.5:35b",
+		Messages: []openai.Message{{
+			Role:      "assistant",
+			Content:   "",
+			ToolCalls: json.RawMessage(`[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Tokyo\"}"}}]`),
+		}},
+	}
+
+	translated, err := ChatCompletionToOllama(request, "")
+	if err != nil {
+		t.Fatalf("ChatCompletionToOllama() error = %v", err)
+	}
+
+	var toolCalls []struct {
+		Function struct {
+			Name      string         `json:"name"`
+			Arguments map[string]any `json:"arguments"`
+		} `json:"function"`
+	}
+	if err := json.Unmarshal(translated.Messages[0].ToolCalls, &toolCalls); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if len(toolCalls) != 1 {
+		t.Fatalf("len(toolCalls) = %d, want 1", len(toolCalls))
+	}
+	if toolCalls[0].Function.Name != "get_weather" {
+		t.Fatalf("name = %q, want get_weather", toolCalls[0].Function.Name)
+	}
+	if toolCalls[0].Function.Arguments["city"] != "Tokyo" {
+		t.Fatalf("arguments = %#v, want city=Tokyo", toolCalls[0].Function.Arguments)
+	}
+}
+
+func TestChatCompletionToOllamaMapsToolResultToToolName(t *testing.T) {
+	t.Parallel()
+
+	request := openai.ChatCompletionRequest{
+		Model: "qwen3.5:35b",
+		Messages: []openai.Message{
+			{
+				Role:      "assistant",
+				Content:   "",
+				ToolCalls: json.RawMessage(`[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Tokyo\"}"}}]`),
+			},
+			{
+				Role:       "tool",
+				Content:    "11 degrees celsius",
+				ToolCallID: "call_1",
+			},
+		},
+	}
+
+	translated, err := ChatCompletionToOllama(request, "")
+	if err != nil {
+		t.Fatalf("ChatCompletionToOllama() error = %v", err)
+	}
+
+	if translated.Messages[1].Role != "tool" {
+		t.Fatalf("role = %q, want tool", translated.Messages[1].Role)
+	}
+	if translated.Messages[1].ToolName != "get_weather" {
+		t.Fatalf("tool name = %q, want get_weather", translated.Messages[1].ToolName)
+	}
+	if translated.Messages[1].Content != "11 degrees celsius" {
+		t.Fatalf("content = %q, want tool output", translated.Messages[1].Content)
+	}
+}
+
 func TestChatCompletionToOllamaPreservesStream(t *testing.T) {
 	t.Parallel()
 
@@ -136,13 +208,77 @@ func TestOllamaToChatCompletionUsesToolFinishReason(t *testing.T) {
 	t.Parallel()
 
 	response := openaiToOllamaResponse("assistant", "", true, "stop")
-	response.Message.ToolCalls = json.RawMessage(`[{"type":"function"}]`)
+	response.Message.ToolCalls = json.RawMessage(`[{"function":{"name":"get_weather","arguments":{"city":"Tokyo"}}}]`)
 	translated := OllamaToChatCompletion(response, "demo")
 	if translated.Choices[0].FinishReason == nil || *translated.Choices[0].FinishReason != "tool_calls" {
 		t.Fatalf("finish reason = %#v", translated.Choices[0].FinishReason)
 	}
-	if string(translated.Choices[0].Message.ToolCalls) != `[{"type":"function"}]` {
-		t.Fatalf("tool calls = %s", translated.Choices[0].Message.ToolCalls)
+
+	var toolCalls []struct {
+		ID       string `json:"id"`
+		Type     string `json:"type"`
+		Function struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		} `json:"function"`
+	}
+	if err := json.Unmarshal(translated.Choices[0].Message.ToolCalls, &toolCalls); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if len(toolCalls) != 1 {
+		t.Fatalf("len(toolCalls) = %d, want 1", len(toolCalls))
+	}
+	if toolCalls[0].ID == "" {
+		t.Fatal("expected generated tool call id")
+	}
+	if toolCalls[0].Type != "function" {
+		t.Fatalf("type = %q, want function", toolCalls[0].Type)
+	}
+	if toolCalls[0].Function.Name != "get_weather" {
+		t.Fatalf("name = %q, want get_weather", toolCalls[0].Function.Name)
+	}
+	if toolCalls[0].Function.Arguments != `{"city":"Tokyo"}` {
+		t.Fatalf("arguments = %q, want {\"city\":\"Tokyo\"}", toolCalls[0].Function.Arguments)
+	}
+}
+
+func TestOllamaToChatCompletionChunkConvertsToolCalls(t *testing.T) {
+	t.Parallel()
+
+	response := openaiToOllamaResponse("assistant", "", false, "")
+	response.Message.ToolCalls = json.RawMessage(`[{"function":{"name":"get_weather","arguments":{"city":"Tokyo"}}}]`)
+
+	chunk := OllamaToChatCompletionChunk(response, "chatcmpl-1", "demo", false)
+
+	var toolCalls []struct {
+		Index    int    `json:"index"`
+		ID       string `json:"id"`
+		Type     string `json:"type"`
+		Function struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		} `json:"function"`
+	}
+	if err := json.Unmarshal(chunk.Choices[0].Delta.ToolCalls, &toolCalls); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if len(toolCalls) != 1 {
+		t.Fatalf("len(toolCalls) = %d, want 1", len(toolCalls))
+	}
+	if toolCalls[0].Index != 0 {
+		t.Fatalf("index = %d, want 0", toolCalls[0].Index)
+	}
+	if toolCalls[0].ID != "call_chatcmpl-1_0" {
+		t.Fatalf("id = %q, want call_chatcmpl-1_0", toolCalls[0].ID)
+	}
+	if toolCalls[0].Type != "function" {
+		t.Fatalf("type = %q, want function", toolCalls[0].Type)
+	}
+	if toolCalls[0].Function.Name != "get_weather" {
+		t.Fatalf("name = %q, want get_weather", toolCalls[0].Function.Name)
+	}
+	if toolCalls[0].Function.Arguments != `{"city":"Tokyo"}` {
+		t.Fatalf("arguments = %q, want {\"city\":\"Tokyo\"}", toolCalls[0].Function.Arguments)
 	}
 }
 

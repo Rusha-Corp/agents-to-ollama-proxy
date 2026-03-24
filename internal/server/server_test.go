@@ -200,6 +200,59 @@ func TestChatCompletionsStreaming(t *testing.T) {
 	}
 }
 
+func TestChatCompletionsStreamingIncludesToolCallOnlyChunk(t *testing.T) {
+	t.Parallel()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request ollama.ChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		if !request.Stream {
+			t.Fatal("expected stream=true")
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"model":"demo-model","created_at":"2026-03-24T00:00:00Z","message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"get_weather","arguments":{"city":"Tokyo"}}}]},"done":false}` + "\n"))
+		_, _ = w.Write([]byte(`{"model":"demo-model","created_at":"2026-03-24T00:00:01Z","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop"}` + "\n"))
+	}))
+	defer upstream.Close()
+
+	handler := newTestHandler(t, upstream)
+	body, _ := json.Marshal(openai.ChatCompletionRequest{
+		Model:    "demo-model",
+		Messages: []openai.Message{{Role: "user", Content: "hello"}},
+		Stream:   true,
+	})
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/ollama/v1/chat/completions", bytes.NewReader(body))
+	request.Header.Set("Authorization", "Bearer proxy-token")
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusOK)
+	}
+
+	payload := response.Body.String()
+	if !strings.Contains(payload, `"tool_calls":[{"index":0,"id":"call_`) {
+		t.Fatalf("stream payload missing tool calls chunk: %s", payload)
+	}
+	if !strings.Contains(payload, `"name":"get_weather"`) {
+		t.Fatalf("stream payload missing tool name: %s", payload)
+	}
+	if !strings.Contains(payload, `"arguments":"{\"city\":\"Tokyo\"}"`) {
+		t.Fatalf("stream payload missing encoded tool arguments: %s", payload)
+	}
+	if !strings.Contains(payload, `"finish_reason":"tool_calls"`) {
+		t.Fatalf("stream payload missing tool_calls finish reason: %s", payload)
+	}
+	if !strings.Contains(payload, `data: [DONE]`) {
+		t.Fatalf("stream payload missing DONE marker: %s", payload)
+	}
+}
+
 func TestRecoveryMiddlewareReturnsInternalServerError(t *testing.T) {
 	t.Parallel()
 

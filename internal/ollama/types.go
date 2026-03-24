@@ -7,6 +7,7 @@ type Message struct {
 	Content    string          `json:"content"`
 	ToolCalls  json.RawMessage `json:"tool_calls,omitempty"`
 	ToolCallID string          `json:"tool_call_id,omitempty"`
+	ToolName   string          `json:"tool_name,omitempty"`
 }
 
 type ChatRequest struct {
