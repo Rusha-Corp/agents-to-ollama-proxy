@@ -3,7 +3,7 @@ set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ENV_FILE="${ROOT_DIR}/.env"
-PROXY_URL="${PROXY_URL:-http://192.168.49.2/ollama/v1/chat/completions}"
+PROXY_URL="${PROXY_URL:-https://ollama-proxy.tierravivaai.net/ollama/v1/chat/completions}"
 MODEL="${MODEL:-qwen3-coder:480b-cloud}"
 PROMPT="${PROMPT:-Reply with LOGTEST only.}"
 MAX_TOKENS="${MAX_TOKENS:-8}"

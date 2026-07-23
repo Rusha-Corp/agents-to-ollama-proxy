@@ -72,18 +72,9 @@ docker run --rm -p 8080:8080 \
 
 ## Kubernetes
 
-The repository includes a base deployment plus a minikube overlay under `k8s/`.
-
-Deploy with the helper script after creating a local `.env` file containing at least `OLLAMA_API_KEY` and `PROXY_BEARER_TOKEN`:
-
-```bash
-./scripts/deploy-minikube.sh
-```
-
-The minikube overlay exposes:
-
-- `/ollama` through ingress for API requests
-- `/healthz` for health checks
+Kubernetes manifests live in [tierravivaai/ollama-proxy-infra](https://github.com/tierravivaai/ollama-proxy-infra).
+Prod runs on EKS via ArgoCD; dev overlay targets k3s. AWS credentials are
+provided to pods via EKS Pod Identity (no IRSA annotation on the ServiceAccount).
 
 ## Development
 
@@ -101,5 +92,3 @@ go test ./...
 - `internal/openai` - OpenAI-compatible request and response types
 - `internal/server` - HTTP handlers, auth, middleware, and streaming
 - `internal/translate` - payload translation and model alias handling
-- `k8s` - Kubernetes manifests
-- `scripts` - deployment and test helpers
